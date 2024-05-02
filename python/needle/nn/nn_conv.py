@@ -16,7 +16,7 @@ class Conv(Module):
     No grouped convolution or dilation
     Only supports square kernels
     """
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, bias=True, device=None, dtype="float32"):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=None, bias=True, device=None, dtype="float32"):
         super().__init__()
         if isinstance(kernel_size, tuple):
             kernel_size = kernel_size[0]
@@ -42,6 +42,8 @@ class Conv(Module):
             self.bias = Parameter(init.rand(out_channels, low=-bound, high=bound, device=device, dtype=dtype), requires_grad=True)
         else:
             self.bias = None
+        
+        self.padding = padding
         ### END YOUR SOLUTION
 
     def forward(self, x: Tensor) -> Tensor:
@@ -53,9 +55,25 @@ class Conv(Module):
 
         assert h == w, 'currently only support for square images'
 
-        pad = (self.kernel_size) // 2
+        pad = (self.kernel_size) // 2 if self.padding is None else self.padding
             
         conv_out = ops.conv(x.transpose((1, 3)).transpose((1, 2)), self.weight, stride=self.stride, padding=pad)
         bias = self.bias.reshape((1,1,1,self.out_channels)).broadcast_to(conv_out.shape)
         return (conv_out + bias).transpose((1, 3)).transpose((2, 3))
         ### END YOUR SOLUTION
+
+
+class MaxPool2d(Module):
+    def __init__(self, kernel_size, stride=1, padding=0, device=None):
+        super().__init__()
+        if isinstance(kernel_size, tuple):
+            kernel_size = kernel_size[0]
+        if isinstance(stride, tuple):
+            stride = stride[0]
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.device = device
+    
+    def forward(self, x: Tensor) -> Tensor:
+        raise NotImplementedError()

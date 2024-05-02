@@ -604,3 +604,53 @@ class Conv(TensorOp):
 
 def conv(a, b, stride=1, padding=1):
     return Conv(stride, padding)(a, b)
+
+
+class MaxPool(TensorOp):
+    def __init__(self, kernel_size, stride=1, padding=0, device=None):
+        super().__init__()
+        if isinstance(kernel_size, tuple):
+            kernel_size = kernel_size[0]
+        if isinstance(stride, tuple):
+            stride = stride[0]
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.device = device
+    
+    def compute(self, X: NDArray) -> NDArray:
+        def im2col(Z, kh, kw, s=1):
+            n, h, w, c = Z.shape
+            nh = (h - kh) // s + 1
+            nw = (w - kw) // s + 1
+            lst_strides = list(Z.strides)
+            new_strides = lst_strides[:3] + lst_strides[1:3] + lst_strides[-1:]
+            new_strides[1] *= s
+            new_strides[2] *= s
+
+            return array_api.NDArray.make(shape=(n, nh, nw, kh, kw, c), 
+                                       strides=tuple(new_strides),
+                                       device=Z._device,
+                                       handle=Z._handle,
+                                       offset=Z._offset)
+        
+        assert len(X.shape) == 4, "requires 4 dims of each operand"
+
+        # do padding
+        if pad := self.padding:
+            X = X.pad(((0, 0), (pad, pad), (pad, pad), (0, 0)))
+        
+        # unpack metadatas
+        n, h, w, c_in = X.shape
+        
+        # pooling via im2col
+        kh = kw = self.kernel_size
+
+        nh = (h - kh) // self.stride + 1
+        nw = (w - kw) // self.stride + 1
+
+        X = im2col(X, kh, kw, s=self.stride).permute((0, 5, 1, 2, 3, 4)).reshape((n, c_in, nh, nw, kh*kw)).max(axis=4)
+        return X.permute((0, 2, 3, 1))
+    
+    def gradient(self, out_grad: Tensor, node: Tensor) -> Tensor:
+        raise NotImplementedError()

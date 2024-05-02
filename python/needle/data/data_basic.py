@@ -55,13 +55,13 @@ class DataLoader:
         self.shuffle = shuffle
         self.batch_size = batch_size
         if not self.shuffle:
-            self.ordering = np.array_split(np.arange(len(dataset)), 
+            self.ordering = np.array_split(np.arange(len(dataset)).astype(np.int32), 
                                            range(batch_size, len(dataset), batch_size))
 
     def __iter__(self):
         ### BEGIN YOUR SOLUTION
         if self.shuffle:
-            arr = np.arange(len(self.dataset))
+            arr = np.arange(len(self.dataset)).astype(np.int32)
             np.random.shuffle(arr)
             self.ordering = np.array_split(arr, range(self.batch_size, len(self.dataset), self.batch_size))
         self.idx = 0
