@@ -57,7 +57,7 @@ class DataLoader:
         if not self.shuffle:
             self.ordering = np.array_split(np.arange(len(dataset)).astype(np.int32), 
                                            range(batch_size, len(dataset), batch_size))
-
+        
     def __iter__(self):
         ### BEGIN YOUR SOLUTION
         if self.shuffle:

@@ -8,7 +8,8 @@ import numpy
 from needle import init
 
 # needle version
-LAZY_MODE = False
+# LAZY_MODE = False
+LAZY_MODE = True
 TENSOR_COUNTER = 0
 
 # NOTE: we will import numpy as the array_api
