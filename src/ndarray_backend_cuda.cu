@@ -18,21 +18,21 @@ namespace cuda {
 typedef float scalar_t;
 const size_t ELEM_SIZE = sizeof(scalar_t);
 
-// std::unordered_map<size_t, std::vector<scalar_t*>> buffer;
+std::unordered_map<size_t, std::vector<scalar_t*>> buffer;
 
 struct CudaArray {
   CudaArray(const size_t size) {
-    // if(buffer[size].size()){
-      // ptr = buffer[size].back();
-      // buffer[size].pop_back();
-    // }
-    // else {
+    if(buffer[size].size()){
+      ptr = buffer[size].back();
+      buffer[size].pop_back();
+    }
+    else {
 
       cudaError_t err = cudaMalloc(&ptr, size * ELEM_SIZE);
       if (err != cudaSuccess){
         throw std::runtime_error(cudaGetErrorString(err));
       }
-    // }
+    }
     this->size = size;
   }
   ~CudaArray() { 
