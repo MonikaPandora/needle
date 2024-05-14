@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -17,23 +18,26 @@ namespace cuda {
 typedef float scalar_t;
 const size_t ELEM_SIZE = sizeof(scalar_t);
 
-std::unordered_map<size_t, std::vector<scalar_t*>> buffer;
+// std::unordered_map<size_t, std::vector<scalar_t*>> buffer;
 
 struct CudaArray {
   CudaArray(const size_t size) {
-    if(buffer[size].size()){
-      ptr = buffer[size].back();
-      buffer[size].pop_back();
-    }
-    else {
+    // if(buffer[size].size()){
+      // ptr = buffer[size].back();
+      // buffer[size].pop_back();
+    // }
+    // else {
+
       cudaError_t err = cudaMalloc(&ptr, size * ELEM_SIZE);
-      if (err != cudaSuccess) throw std::runtime_error(cudaGetErrorString(err));
-    }
+      if (err != cudaSuccess){
+        throw std::runtime_error(cudaGetErrorString(err));
+      }
+    // }
     this->size = size;
   }
   ~CudaArray() { 
-    //cudaFree(ptr);
-    buffer[size].push_back(ptr);
+    cudaFree(ptr);
+    // buffer[size].push_back(ptr);
   }
   size_t ptr_as_int() { return (size_t)ptr; }
   
@@ -390,25 +394,47 @@ def_ewise_ufunc_cuda_kernel(Tanh, tanhf)
 def_ewise_ufunc_cuda(Tanh)
 
 
-#define min(a, b) ((a) < (b) ? (a) : (b))
+// #define min(a, b) ((a) < (b) ? (a) : (b))
 
+/*
+  Naive version of matmul
+*/
+
+__global__ void MatmulKernel_00(const scalar_t* a, const scalar_t* b, scalar_t* out, uint32_t M, uint32_t N, uint32_t P){
+  int tx = blockIdx.x * blockDim.x + threadIdx.x;
+  int ty = blockIdx.y * blockDim.y + threadIdx.y;
+  if(ty < M && tx < P) {
+      scalar_t c = 0;
+      for(int i = 0; i < N; ++i){
+          c += a[ty * N + i] * b[i * P + tx];
+      }
+      out[ty * P + tx] = c;
+  }
+}
+
+/*
+  simple using of shared memory
+*/
+#define KERNEL1_BLOCK_SIZE 16
 __global__ void MatmulKernel_01(const scalar_t* a, const scalar_t* b, scalar_t* out, uint32_t M, uint32_t N, uint32_t P){
   const int blockRow = blockIdx.y;
   const int blockCol = blockIdx.x;
 
   // which block
-  scalar_t* outSub = &out[(blockRow * P + blockCol) * TILE];
-  size_t outDimX = min(TILE, P - blockCol * TILE);
-  size_t outDimY = min(TILE, M - blockRow * TILE);
+  scalar_t* outSub = &out[(blockRow * P + blockCol) * KERNEL1_BLOCK_SIZE];
+  size_t outDimX = min(KERNEL1_BLOCK_SIZE, P - blockCol * KERNEL1_BLOCK_SIZE);
+  size_t outDimY = min(KERNEL1_BLOCK_SIZE, M - blockRow * KERNEL1_BLOCK_SIZE);
+
+  __shared__ scalar_t as[KERNEL1_BLOCK_SIZE][KERNEL1_BLOCK_SIZE];
+  __shared__ scalar_t bs[KERNEL1_BLOCK_SIZE][KERNEL1_BLOCK_SIZE];
 
   scalar_t val = 0.;
-  for(size_t k = 0; k < N; k += TILE){
+  for(size_t k = 0; k < N; k += KERNEL1_BLOCK_SIZE){
     __syncthreads();
-    size_t innerDim = min(TILE, N - k);
-    const scalar_t* aSub = &a[blockRow * TILE * N + k];
-    const scalar_t* bSub = &b[k * P + blockCol * TILE];
-    __shared__ scalar_t as[TILE][TILE];
-    __shared__ scalar_t bs[TILE][TILE];
+    size_t innerDim = min((int)KERNEL1_BLOCK_SIZE, (int)(N - k));
+    const scalar_t* aSub = &a[blockRow * KERNEL1_BLOCK_SIZE * N + k];
+    const scalar_t* bSub = &b[k * P + blockCol * KERNEL1_BLOCK_SIZE];
+    
     if(threadIdx.x < innerDim && threadIdx.y < outDimY){
       as[threadIdx.y][threadIdx.x] = aSub[threadIdx.y * N + threadIdx.x];
     }
@@ -428,60 +454,108 @@ __global__ void MatmulKernel_01(const scalar_t* a, const scalar_t* b, scalar_t* 
     outSub[threadIdx.y * P + threadIdx.x] = val;
 }
 
+/*
+  each thread computes a tile * tile submatrix
+*/
+#define T 8
+#define BLOCK_SIZE 128
+#define INNER_STEP 8
+__global__ void MatmulKernel_02(const scalar_t* a, const scalar_t* b, scalar_t* out, int M, int N, int P){
+  int bx = blockIdx.x;
+  int by = blockIdx.y;
 
-#define BLOCK_SIZE (4*TILE)
-#define INNER_STEP 256
-__global__ void MatmulKernel_02(const scalar_t* a, const scalar_t* b, scalar_t* out, uint32_t M, uint32_t N, uint32_t P){
-  size_t blockRow = blockIdx.y;
-  size_t blockCol = blockIdx.x;
+  int tx = threadIdx.x;
+  int ty = threadIdx.y;
 
-  scalar_t* outBlockBase = &out[(blockRow * P + blockCol) * BLOCK_SIZE];
-  int outBlockDimX = min(BLOCK_SIZE, P - blockCol * BLOCK_SIZE);
-  int outBlockDimY = min(BLOCK_SIZE, M - blockRow * BLOCK_SIZE);
+  int outBlockBaseOff = (by * P + bx) * BLOCK_SIZE;
+  int outBlockDimX = min(BLOCK_SIZE, P - bx * BLOCK_SIZE);
+  int outBlockDimY = min(BLOCK_SIZE, M - by * BLOCK_SIZE);
 
   // using int for threads whose dim is negtive
-  int tileDimX = min(TILE, outBlockDimX - (int)(threadIdx.x * TILE));
-  int tileDimY = min(TILE, outBlockDimY - (int)(threadIdx.y * TILE));
+  int tileDimX = min(T, outBlockDimX - tx * T);
+  int tileDimY = min(T, outBlockDimY - ty * T);
 
-  scalar_t c[TILE][TILE] = {0.};
-  __shared__ scalar_t as[BLOCK_SIZE][INNER_STEP];
+  scalar_t c[T][T] = {0.};
+  __shared__ scalar_t as[INNER_STEP][BLOCK_SIZE];
   __shared__ scalar_t bs[INNER_STEP][BLOCK_SIZE];
-  for(size_t k = 0; k < N; k += INNER_STEP){
-    __syncthreads();
-    const scalar_t* aBlockBase = &a[blockRow * BLOCK_SIZE * N + k];
-    const scalar_t* bBlockBase = &b[k * P + blockCol * BLOCK_SIZE];
-    size_t innerDim = min(INNER_STEP, N - k);
-    for(size_t aj_bi = threadIdx.x; aj_bi < innerDim; aj_bi += blockDim.x){
-      for(size_t ai = threadIdx.y; ai < outBlockDimY; ai += blockDim.y){
-        as[ai][aj_bi] = aBlockBase[ai * N + aj_bi];
+
+
+  int tid = ty * blockDim.x + tx;
+  int a_i = tid >> 1;
+  int a_j = (tid & 1) << 2;
+  int b_i = tid >> 5;
+  int b_j = (tid & 31) << 2;
+  for(int k = 0; k < N; k += INNER_STEP){
+    int aBlockBaseOff = by * BLOCK_SIZE * N + k;
+    int bBlockBaseOff = k * P + bx * BLOCK_SIZE;
+    int innerDim = min(INNER_STEP, N - k);
+
+    if(a_i < outBlockDimY && a_j < innerDim){
+      if((N & 3) || innerDim - a_j < 4){
+        // not aligned to 128 bytes
+        // or no 4 more elements
+        for(int t = 0; t < min(innerDim - a_j, 4); ++t){
+          as[a_j + t][a_i] = a[aBlockBaseOff + a_i * N + a_j + t];
+        }
       }
-      for(size_t bj = threadIdx.y; bj < outBlockDimX; bj += blockDim.y){
-        bs[aj_bi][bj] = bBlockBase[aj_bi * P + bj];
+      else{
+        float4 load_a_reg = reinterpret_cast<const float4*>(&a[aBlockBaseOff + a_i * N + a_j])[0];
+        as[a_j][a_i] = load_a_reg.x;
+        as[a_j + 1][a_i] = load_a_reg.y;
+        as[a_j + 2][a_i] = load_a_reg.z;
+        as[a_j + 3][a_i] = load_a_reg.w;
       }
     }
-    __syncthreads();
-
-    #pragma unroll
-    for(int i = 0; i < tileDimY; ++i){
-      #pragma unroll
-      for(int j = 0; j < tileDimX; ++j){
-        #pragma unroll
-        for(int e = 0; e < innerDim; ++e){
-          c[i][j] += as[threadIdx.y * TILE + i][e] * bs[e][threadIdx.x * TILE + j];
+    
+    if(b_i < innerDim && b_j < outBlockDimX){
+      if((P & 3) || outBlockDimX - b_j < 4){
+        // not aligned to 128 bytes
+        // or no 4 more elements
+        for(int t = 0; t < min(outBlockDimX - b_j, 4); ++t){
+          bs[b_i][b_j + t] = b[bBlockBaseOff + b_i * P + b_j + t];
         }
+      }
+      else{
+        reinterpret_cast<float4*>(&bs[b_i][b_j])[0] = reinterpret_cast<const float4*>(&b[bBlockBaseOff + b_i * P + b_j])[0];
+      }
+    }
+    
+    // sync for loading data into shared memory
+    __syncthreads();
+    float compute_a_reg[T];
+    float compute_b_reg[T];
+
+    for(int e = 0; e < innerDim; ++e){
+        reinterpret_cast<float4*>(&compute_a_reg[0])[0] = reinterpret_cast<float4*>(&as[e][ty * T])[0];
+        reinterpret_cast<float4*>(&compute_a_reg[4])[0] = reinterpret_cast<float4*>(&as[e][ty * T + 4])[0];
+        reinterpret_cast<float4*>(&compute_b_reg[0])[0] = reinterpret_cast<float4*>(&bs[e][tx * T])[0];
+        reinterpret_cast<float4*>(&compute_b_reg[4])[0] = reinterpret_cast<float4*>(&bs[e][tx * T + 4])[0];
+        for(int i = 0; i < tileDimY; ++i){
+            for(int j = 0; j < tileDimX; ++j){
+                c[i][j] += compute_a_reg[i] * compute_b_reg[j];
+            }
+        }
+    }
+    __syncthreads();
+  }
+
+  int outTileBaseOff = outBlockBaseOff + ty * T * P + tx * T;
+  if(P & 3) {
+    for(int i = 0; i < tileDimY; ++i){
+      for(int j = 0; j < tileDimX; ++j){
+        out[outTileBaseOff + i * P + j] = c[i][j];
       }
     }
   }
-
-  scalar_t* outTileBase = &outBlockBase[threadIdx.y * TILE * P + threadIdx.x * TILE];
-  #pragma unroll
-  for(int i = 0; i < tileDimY; ++i){
-    #pragma unroll
-    for(int j = 0; j < tileDimX; ++j){
-      outTileBase[i * P + j] = c[i][j];
+  else {
+    for(int i = 0; i < tileDimY; ++i){
+      for(int j = 0; j < tileDimX; j+=4){
+        reinterpret_cast<float4*>(&out[outTileBaseOff + i * P + j])[0] = reinterpret_cast<const float4*>(&c[i][j])[0];
+      }
     }
   }
 }
+
 
 void Matmul(const CudaArray& a, const CudaArray& b, CudaArray* out, uint32_t M, uint32_t N,
             uint32_t P) {
@@ -508,20 +582,53 @@ void Matmul(const CudaArray& a, const CudaArray& b, CudaArray* out, uint32_t M, 
    */
 
   /// BEGIN SOLUTION
+  // int kernel = 2;
+  // switch(kernel){
+  //   case 0: {
+  //     // invoking kernel_00
+  //     dim3 dimGrid((P + 15) / 16, (M + 15) / 16, 1);
+  //     dim3 dimBlock(16, 16, 1);
+  //     MatmulKernel_00<<<dimGrid, dimBlock>>>(a.ptr, b.ptr, out->ptr, M, N, P);
+  //     break;
+  //   }
+  //   case 1: {
+  //     // invoking kernel_01
+  //     size_t BM = (M + KERNEL1_BLOCK_SIZE - 1) / KERNEL1_BLOCK_SIZE;
+  //     size_t BP = (P + KERNEL1_BLOCK_SIZE - 1) / KERNEL1_BLOCK_SIZE;
+  //     dim3 grid = dim3(BP, BM, 1);
+  //     dim3 block = dim3(KERNEL1_BLOCK_SIZE, KERNEL1_BLOCK_SIZE, 1);
+  //     MatmulKernel_01<<<grid, block>>>(a.ptr, b.ptr, out->ptr, M, N, P);
+  //     break;
+  //   }
+  //   case 2: {
+  //     // invoking kernel_02
+  //     size_t BM = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  //     size_t BP = (P + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  //     dim3 grid = dim3(BP, BM);
+  //     dim3 block = dim3(BLOCK_SIZE / T, BLOCK_SIZE / T);
+  //     MatmulKernel_02<<<grid, block>>>(a.ptr, b.ptr, out->ptr, M, N, P);
+  //     break;
+  //   }
+  //   default: assert(0);
+  // }
 
-  // invoking kernel_01
-  // size_t BM = (M + TILE - 1) / TILE;
-  // size_t BP = (P + TILE - 1) / TILE;
-  // dim3 grid = dim3(BP, BM, 1);
-  // dim3 block = dim3(TILE, TILE, 1);
-  // MatmulKernel_01<<<grid, block>>>(a.ptr, b.ptr, out->ptr, M, N, P);
+  // if(M % 8 == 0 && N % 8 == 0 && P % 8 == 0 && 
+  //     M >= 512 && M == N && P == N){
+  //   size_t BM = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  //   size_t BP = (P + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  //   dim3 grid = dim3(BP, BM);
+  //   dim3 block = dim3(BLOCK_SIZE / T, BLOCK_SIZE / T);
+  //   MatmulKernel_02<<<grid, block>>>(a.ptr, b.ptr, out->ptr, M, N, P);
+  // }
+  // else {
+    size_t BM = (M + KERNEL1_BLOCK_SIZE - 1) / KERNEL1_BLOCK_SIZE;
+    size_t BP = (P + KERNEL1_BLOCK_SIZE - 1) / KERNEL1_BLOCK_SIZE;
+    dim3 grid = dim3(BP, BM, 1);
+    dim3 block = dim3(KERNEL1_BLOCK_SIZE, KERNEL1_BLOCK_SIZE, 1);
+    MatmulKernel_01<<<grid, block>>>(a.ptr, b.ptr, out->ptr, M, N, P);
+  // }
 
-  // invoking kernel_02
-  size_t BM = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
-  size_t BP = (P + BLOCK_SIZE - 1) / BLOCK_SIZE;
-  dim3 grid = dim3(BP, BM, 1);
-  dim3 block = dim3(BLOCK_SIZE / TILE, BLOCK_SIZE / TILE, 1);
-  MatmulKernel_02<<<grid, block>>>(a.ptr, b.ptr, out->ptr, M, N, P);
+  cudaDeviceSynchronize();
   /// END SOLUTION
 }
 
