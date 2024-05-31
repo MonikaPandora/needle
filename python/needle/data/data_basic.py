@@ -2,7 +2,7 @@ import numpy as np
 from ..autograd import Tensor
 
 from typing import Iterator, Optional, List, Sized, Union, Iterable, Any
-
+from multiprocessing import Process, Semaphore
 
 
 class Dataset:
@@ -29,6 +29,14 @@ class Dataset:
                 x = tform(x)
         return x
 
+buf = None
+def load(dataset, ordering, sem):
+    global buf
+    tmp = tuple([Tensor(pos) for pos in dataset[ordering]])
+    sem.acquire()
+    buf = tmp
+    sem.release()
+
 
 class DataLoader:
     r"""
@@ -54,10 +62,11 @@ class DataLoader:
         self.dataset = dataset
         self.shuffle = shuffle
         self.batch_size = batch_size
+        self.sem = Semaphore()
         if not self.shuffle:
             self.ordering = np.array_split(np.arange(len(dataset)).astype(np.int32), 
                                            range(batch_size, len(dataset), batch_size))
-        
+
     def __iter__(self):
         ### BEGIN YOUR SOLUTION
         if self.shuffle:
@@ -67,14 +76,38 @@ class DataLoader:
         self.idx = 0
         ### END YOUR SOLUTION
         return self
+    
+    def next_prefetch(self):
+        self.sem.acquire()
+        global buf
+        if buf:
+            ret = buf
+            buf = None
+            self.sem.release()
+            if self.idx + 1 < len(self.ordering):
+                Process(target=load, args=(self.dataset, self.ordering[self.idx + 1], self.sem)).start()
+            self.idx += 1
+            return ret
+        self.sem.release()
+        ordering = self.ordering[self.idx]
+        batch = self.dataset[ordering]
+        if self.idx + 1 < len(self.ordering):
+            Process(target=load, args=(self.dataset, self.ordering[self.idx + 1], self.sem)).start()
+        self.idx += 1
+        return tuple([Tensor(pos) for pos in batch])
+
+    def next(self):
+        ordering = self.ordering[self.idx]
+        batch = self.dataset[ordering]
+        self.idx += 1
+        return tuple([Tensor(pos) for pos in batch])
 
     def __next__(self):
         ### BEGIN YOUR SOLUTION
         if self.idx == len(self.ordering):
             raise StopIteration
-        batch = self.dataset[self.ordering[self.idx]]
-        self.idx += 1
-        return tuple([Tensor(pos) for pos in batch])
+        # return self.next_prefetch()
+        return self.next()
         ### END YOUR SOLUTION
 
 
